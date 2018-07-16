@@ -2,19 +2,22 @@ require 'open-uri'
 require 'nokogiri'
 require 'json'
 require 'net/http'
+require 'net/https'
 require 'uri'
 require 'pp'
 require 'openssl'
 require 'CSV'
+require 'digest/md5'
 
 # 検索タグ
 SEARCHTAG = '岸和田'
-# POSTするURL
-POSTURL = 'https://www.instagram.com/query/'
+
 # 取得対象ページ
 url = 'https://www.instagram.com/explore/tags/' + URI.encode_www_form_component(SEARCHTAG)
-# 取得ページ数（暫定的に1ページのみの対応）
-GETPAGES = 1
+# 取得したい投稿数
+GETPHOTOS = 100
+# 取得した件数
+gotNumber = 0
 
 # 保存ファイル名（拡張子除く）
 csvfilename = Time.now.strftime("%Y%m%d%H%M%S")
@@ -22,28 +25,8 @@ csvfilename = Time.now.strftime("%Y%m%d%H%M%S")
 # 文字コード
 charset = nil
 
-puts SEARCHTAG + " のデータを #{GETPAGES} 件取得します"
+puts SEARCHTAG + " のデータを #{GETPHOTOS} 件分取得します"
 
-# JSONデータを配列に格納する
-def parseInstagramJson(jsondata)
- returnData = []
- jsondata.length.times { |i|
-   oneData = {}
-   oneData["code"] = jsondata[i]["code"]
-   oneData["date"] = jsondata[i]["date"]
-   oneData["comments"] = jsondata[i]["comments"]
-   oneData["caption"] = jsondata[i]["caption"]
-   oneData["likes"] = jsondata[i]["likes"]
-   oneData["owner"] = jsondata[i]["owner"]
-   oneData["thumbnail"] = jsondata[i]["thumbnail_src"]
-   oneData["is_video"] = jsondata[i]["is_video"]
-   oneData["id"] = jsondata[i]["id"]
-   oneData["location"] = jsondata[i]["location"]
-
-   returnData.push(oneData)
- }
- return returnData
-end
 
 # CSVファイルのヘッダを記入
 def headerWrite(csvfilename)
@@ -59,46 +42,11 @@ def headerWrite(csvfilename)
  
     csv << writeData
   end
- end
-
-# ユーザのコメントを表示
-# 複数件ある場合は改行で区切る
-def getUserComments(url)
-  charset = nil
-
-  commentsArray = Array.new
-
-  # 文字コードを取得しつつ、ページにアクセス
-  html = open(url) do |f|
-    charset = f.charset
-    f.read
-  end
-
-  # 全部のHTMLを取得
-  allDoc = Nokogiri::HTML.parse(html, nil, charset)
-  # メタ情報だけ取得
-  metaInfo = allDoc.css('script')[6].text
-  # 前後に不要な情報があるのでカット
-  metaInfo.slice!(0, 21)
-  metaInfo = metaInfo.chop
-
-  metaInfo = JSON.load(metaInfo)
-
-  # コメント数の取得
-  commentsCount = metaInfo['entry_data']['PostPage'][0]['media']['comments']['count']
-
-  commentsCount.times {|i|
-    commentText = metaInfo['entry_data']['PostPage'][0]['media']['comments']['nodes'][i]['text']
-    strText = commentText.gsub(/\\u([\da-fA-F]{4})/) { [$1].pack('H*').unpack('n*').pack('U*') }
-    commentsArray.push(strText)
-  }
-
-  return commentsArray.join("\r\n")
 end
 
-# CSVファイルへの書き込み
-def csvWrite(dataArray, csvfilename)
 
+# CSVファイルへの書き込み
+def csvWrite(dataArray, csvfilename, gotNumber)
 	dataArray.length.times {|i|
 	  CSV.open("getInstagramData_#{csvfilename}.csv", "ab+") do |csv|
 	    writeData = Array.new
@@ -114,7 +62,6 @@ def csvWrite(dataArray, csvfilename)
       # ページURLの取得
       writeData.push("https://www.instagram.com/p/" + dataArray[i]['node']['shortcode'] + "/")
 
-
 	    # いいねの数とコメントの数
       writeData.push(dataArray[i]['node']['edge_liked_by']['count'])
       writeData.push(dataArray[i]['node']['edge_media_to_comment']['count'])
@@ -122,41 +69,34 @@ def csvWrite(dataArray, csvfilename)
       # 投稿者コメントからタグのみ抽出
 	    writeData.push((dataArray[i]['node']['edge_media_to_caption']['edges'][0]['node']['text'] + " ").scan(/[#][Ａ-Ｚａ-ｚA-Za-z一-鿆0-9０-９ぁ-ヶｦ-ﾟー○]+/).join(" "))
 	    # 投稿者コメントの取得
-	    writeData.push("\""+dataArray[i]['node']['edge_media_to_caption']['edges'][0]['node']['text']+"\"")
-
-
-	    csv << writeData
-	  end
-	}
+      writeData.push("\""+dataArray[i]['node']['edge_media_to_caption']['edges'][0]['node']['text']+"\"")
+      
+      csv << writeData
+      gotNumber += 1
+    end
+    # 予定取得枚数に到達したら終了
+    if gotNumber >= GETPHOTOS then
+      return gotNumber
+    end
+  }
+  return gotNumber
 end
 
-# 2ページ以上取得する場合は次の情報を取得
-def getNextPage(start_cursor, csrf_token)
-  # postの準備
-  uri = URI.parse(POSTURL)
-  https = Net::HTTP.new(uri.host, uri.port)
 
-  https.use_ssl = true
+def getNextPage2(endCursor, csrfToken, rhx_gis, gotNumber)
+  uri = URI.parse("https://www.instagram.com/explore/tags/" + URI.encode_www_form_component(SEARCHTAG) + "/?__a=1&max_id=" + endCursor)
+  http = Net::HTTP.new(uri.host, uri.port)
+  
+  http.use_ssl = true
+  http.verify_mode = OpenSSL::SSL::VERIFY_NONE
 
-  req = Net::HTTP::Post.new(uri.request_uri)
-  # ヘッダの作成
-  req["Host"] = "www.instagram.com"
-  req["Content-Type"] = "application/x-www-form-urlencoded; charset=UTF-8"
-  req["X-Instagram-AJAX"] = 1
-  req["X-CSRFToken"] = csrf_token
-  req["X-Requested-With"] = "XMLHttpRequest"
-  req["Referer"] = "https://www.instagram.com/explore/tags/"+SEARCHTAG+"/"
-  req["Cookie"] = "csrftoken="+csrf_token+";"
-  req["Connection"] = "keep-alive"
+  req = Net::HTTP::Get.new(uri.request_uri)
 
-
-  # POSTデータの作成
-  req.body = "q=ig_hashtag(#{SEARCHTAG})+%7B+media.after(#{start_cursor}%2C+12)+%7B%0A++count%2C%0A++nodes+%7B%0A++++caption%2C%0A++++code%2C%0A++++location+%7B%0A++++++id%2C%0A++++++lat%2C%0A++++++lng%0A++++%7D%2C%0A++++comments+%7B%0A++++++count%0A++++%7D%2C%0A++++date%2C%0A++++dimensions+%7B%0A++++++height%2C%0A++++++width%0A++++%7D%2C%0A++++display_src%2C%0A++++id%2C%0A++++is_video%2C%0A++++likes+%7B%0A++++++count%0A++++%7D%2C%0A++++owner+%7B%0A++++++id%2C%0A++++++username%2C%0A++++++full_name%0A++++%7D%2C%0A++++thumbnail_src%0A++%7D%2C%0A++page_info%0A%7D%0A+%7D&ref=tags%3A%3Ashow'"
-  res = https.request(req)
-  puts "mes -> #{res.message}"
-
-  return [JSON.parse(res.body)['media']['nodes'], JSON.parse(res.body)['media']['page_info']['end_cursor']]
-
+  res = http.request(req)
+  endCursor = JSON.parse(res.body)['graphql']['hashtag']['edge_hashtag_to_media']['page_info']['end_cursor']
+  dataArray =  JSON.parse(res.body)['graphql']['hashtag']['edge_hashtag_to_media']['edges']
+  
+  return dataArray, endCursor
 end
 
 # 文字コードを取得しつつ、ページにアクセス
@@ -173,12 +113,39 @@ metaInfo = allDoc.css('body script').first.text
 metaInfo.slice!(0, 21)
 metaInfo = metaInfo.chop
 
+# csrfトークンの取得
+csrfToken = JSON.parse(metaInfo)['config']['csrf_token']
+
+# rhx_gis
+rhx_gis = JSON.parse(metaInfo)['rhx_gis']
+
+# データの中身を取得
 dataArray = JSON.parse(metaInfo)['entry_data']['TagPage'][0]['graphql']['hashtag']['edge_hashtag_to_media']['edges'];
 
+# 次のページ取得用のカーソル
+endCursor = JSON.parse(metaInfo)['entry_data']['TagPage'][0]['graphql']['hashtag']['edge_hashtag_to_media']['page_info']['end_cursor'];
+
+# csvファイルにヘッダを記入
 headerWrite(csvfilename)
 
 puts "データ取得します"
 
-csvWrite(dataArray, csvfilename)
+# csvファイルに保存
+gotNumber = csvWrite(dataArray, csvfilename, gotNumber)
+
+# 取得した件数を記録
+puts "#{gotNumber} 件取得しました"
+
+# 取得件数が足りない場合は、追加で取りに行く
+while GETPHOTOS > gotNumber do
+  # 5秒待つ
+  puts "5秒待ってから再開します"
+  sleep 5
+  dataArray, endCursor = getNextPage2(endCursor, csrfToken, rhx_gis, gotNumber)
+  
+  # 取得枚数を更新
+  gotNumber = csvWrite(dataArray, csvfilename, gotNumber)
+  puts "#{gotNumber} 件取得しました"
+end
 
 puts "終了しました"
