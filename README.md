@@ -33,7 +33,7 @@ instagramData.instagram_data
 # 投稿者コメント    instagramData.instagram_data[0][:caption]
 # 投稿者ID          instagramData.instagram_data[0][:userId]
 
-# writeToCSVメソッドでCSVファイルに書き出す
+# writeToCSVメソッドでCSVファイルに書き出す
 # 第一引数にはデータを指定する
 # 第二引数を指定しなければ、
 # getInstagramData_201807222200.csv
